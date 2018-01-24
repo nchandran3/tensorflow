@@ -479,8 +479,12 @@ def batch_norm(inputs,
 
     Sergey Ioffe, Christian Szegedy
 
-  Can be used as a normalizer function for conv2d and fully_connected.
-
+  Can be used as a normalizer function for conv2d and fully_connected. The
+  normalization is over all but the last dimension if `data_format` is `NHWC`
+  and all but the second dimension if `data_format` is `NCHW`.  In case of a 2D
+  tensor this corresponds to the batch dimension, while in case of a 4D tensor this
+  corresponds to the batch and space dimensions.
+  
   Note: when training, the moving_mean and moving_variance need to be updated.
   By default the update ops are placed in `tf.GraphKeys.UPDATE_OPS`, so they
   need to be added as a dependency to the `train_op`. For example:
@@ -1896,7 +1900,7 @@ class GDN(base.Layer):
     outputs.set_shape(inputs.get_shape())
     return outputs
 
-  def _compute_output_shape(self, input_shape):
+  def compute_output_shape(self, input_shape):
     channel_axis = self._channel_axis()
     input_shape = tensor_shape.TensorShape(input_shape)
     if not 3 <= input_shape.ndim <= 5:
@@ -2674,16 +2678,25 @@ def spatial_softmax(features,
                                         indexing='ij')
       pos_x = array_ops.reshape(pos_x, [height * width])
       pos_y = array_ops.reshape(pos_y, [height * width])
+      
       if temperature is None:
-        temperature_collections = utils.get_variable_collections(
-            variables_collections, 'temperature')
-        temperature = variables.model_variable(
-            'temperature',
-            shape=(),
-            dtype=dtypes.float32,
-            initializer=init_ops.ones_initializer(),
-            collections=temperature_collections,
-            trainable=trainable)
+        temp_initializer = init_ops.ones_initializer()
+      else:
+        temp_initializer = init_ops.constant_initializer(temperature)
+          
+      if not trainable:
+        temp_collections = None
+      else:
+        temp_collections = utils.get_variable_collections(
+              variables_collections, 'temperature')
+      
+      temperature = variables.model_variable(
+          'temperature',
+          shape=(),
+          dtype=dtypes.float32,
+          initializer=temp_initializer,
+          collections=temp_collections,
+          trainable=trainable)
       if data_format == 'NCHW':
         features = array_ops.reshape(features, [-1, height * width])
       else:

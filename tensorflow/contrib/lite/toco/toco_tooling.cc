@@ -52,6 +52,7 @@ void MakeGeneralGraphTransformationsSet(
     GraphTransformationsSet* transformations) {
   CHECK(transformations->empty());
   transformations->Add(new ConvertExpandDimsToReshape);
+  transformations->Add(new ConvertTrivialTransposeToReshape);
   transformations->Add(new ResolveReshapeAttributes);
   transformations->Add(new PropagateArrayDataTypes);
   transformations->Add(new PropagateFixedSizes);
@@ -67,9 +68,13 @@ void MakeGeneralGraphTransformationsSet(
   transformations->Add(new FuseBinaryIntoFollowingAffine);
   transformations->Add(new ResolveBatchNormalization);
   transformations->Add(new ResolveConstantBinaryOperator);
+  transformations->Add(new ResolveConstantFill);
+  transformations->Add(new ResolveConstantRange);
+  transformations->Add(new ResolveConstantStack);
+  transformations->Add(new ResolveConstantStridedSlice);
   transformations->Add(new ResolveConstantUnaryOperator);
   transformations->Add(new ResolveTensorFlowMerge);
-  transformations->Add(new ResolveTensorFlowSqueeze);
+  transformations->Add(new ResolveSqueezeAttributes);
   transformations->Add(new ResolveTensorFlowSwitch);
   transformations->Add(new ResolveTensorFlowTile);
   transformations->Add(new ResolveTensorFlowConcat);
@@ -78,11 +83,14 @@ void MakeGeneralGraphTransformationsSet(
   transformations->Add(new IdentifyRelu1);
   transformations->Add(new RemoveTrivialBinaryOperator);
   transformations->Add(new ReadFakeQuantMinMax);
+  transformations->Add(new ResolveSpaceToBatchNDAttributes);
+  transformations->Add(new ResolveBatchToSpaceNDAttributes);
   transformations->Add(new ResolvePadAttributes);
   transformations->Add(new ResolveStridedSliceAttributes);
   transformations->Add(new ResolveSliceAttributes);
   transformations->Add(new ResolveMeanAttributes);
-  transformations->Add(new ResolveConstantTensorFlowShape);
+  transformations->Add(new ResolveTransposeAttributes);
+  transformations->Add(new ResolveConstantShapeOrRank);
   transformations->Add(new MakeInitialDequantizeOperator);
 }
 
@@ -185,6 +193,13 @@ void Transform(const TocoFlags& toco_flags, Model* model) {
 
   SetFinalDataTypeOnInputs(toco_flags, model);
 
+  // Remove unused ops before performing any other optimizations. This is to
+  // stop optimizations from crossing the input/output boundaries. For example
+  // this will stop BatchNorm fusing if the output node is in between a conv
+  // and BatchNorm layers.
+  RunGraphTransformations(model, "Removing unused ops",
+                          {new toco::RemoveUnusedOp});
+
   GraphTransformationsSet transformations;
   MakeGeneralGraphTransformationsSet(&transformations);
   auto* remove_trivial_reshape = new RemoveTrivialReshape;
@@ -226,6 +241,10 @@ void Transform(const TocoFlags& toco_flags, Model* model) {
         toco_flags.has_default_ranges_max()) {
       UseDefaultMinMaxRangeValues(model, toco_flags.default_ranges_min(),
                                   toco_flags.default_ranges_max());
+      // The new MinMax info may need to be propagated a bit.
+      RunGraphTransformations(
+          model, "default min-max range propagation graph transformations",
+          {new HardcodeMinMax});
     }
     CheckIsReadyForQuantization(*model);
     RunGraphTransformations(

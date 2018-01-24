@@ -28,6 +28,7 @@ from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import op_def_registry
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_shape
+from tensorflow.python.layers import base as base_layer
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import clip_ops
 from tensorflow.python.ops import init_ops
@@ -37,6 +38,7 @@ from tensorflow.python.ops import random_ops
 from tensorflow.python.ops import rnn_cell_impl
 from tensorflow.python.ops import variable_scope as vs
 from tensorflow.python.ops import partitioned_variables
+from tensorflow.python.ops import nn_impl
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.util import nest
 
@@ -327,7 +329,7 @@ class TimeFreqLSTMCell(rnn_cell_impl.RNNCell):
   def __init__(self, num_units, use_peepholes=False,
                cell_clip=None, initializer=None,
                num_unit_shards=1, forget_bias=1.0,
-               feature_size=None, frequency_skip=None,
+               feature_size=None, frequency_skip=1,
                reuse=None):
     """Initialize the parameters for an LSTM cell.
 
@@ -1822,7 +1824,7 @@ class CompiledWrapper(rnn_cell_impl.RNNCell):
         return not _REGISTERED_OPS[node_def.op].is_stateful
 
     with jit.experimental_jit_scope(compile_ops=compile_ops):
-      return self._cell(inputs, state, scope)
+      return self._cell(inputs, state, scope=scope)
 
 
 def _random_exp_initializer(minval,
@@ -2630,3 +2632,349 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
 
     new_state = (rnn_cell_impl.LSTMStateTuple(c, m))
     return m, new_state
+
+
+class SRUCell(rnn_cell_impl._LayerRNNCell):
+  """SRU, Simple Recurrent Unit
+     Implementation based on
+     Training RNNs as Fast as CNNs (cf. https://arxiv.org/abs/1709.02755).
+
+     This variation of RNN cell is characterized by the simplified data dependence
+     between hidden states of two consecutive time steps. Traditionally, hidden
+     states from a cell at time step t-1 needs to be multiplied with a matrix
+     W_hh before being fed into the ensuing cell at time step t.
+     This flavor of RNN replaces the matrix multiplication between h_{t-1}
+     and W_hh with a pointwise multiplication, resulting in performance
+     gain.
+
+  Args:
+    num_units: int, The number of units in the SRU cell.
+    activation: Nonlinearity to use.  Default: `tanh`.
+    reuse: (optional) Python boolean describing whether to reuse variables
+      in an existing scope.  If not `True`, and the existing scope already has
+      the given variables, an error is raised.
+    name: (optional) String, the name of the layer. Layers with the same name
+      will share weights, but to avoid mistakes we require reuse=True in such
+      cases.
+  """
+  def __init__(self, num_units,
+               activation=None, reuse=None, name=None):
+    super(SRUCell, self).__init__(_reuse=reuse, name=name)
+    self._num_units = num_units
+    self._activation = activation or math_ops.tanh
+
+    # Restrict inputs to be 2-dimensional matrices
+    self.input_spec = base_layer.InputSpec(ndim=2)
+
+  @property
+  def state_size(self):
+    return self._num_units
+
+  @property
+  def output_size(self):
+    return self._num_units
+
+  def build(self, inputs_shape):
+    if inputs_shape[1].value is None:
+      raise ValueError("Expected inputs.shape[-1] to be known, saw shape: %s"
+                       % inputs_shape)
+
+    input_depth = inputs_shape[1].value
+
+    # Here the contributor believes that the following constraints
+    # are implied. The reasoning is explained here with reference to
+    # the paper https://arxiv.org/pdf/1709.02755.pdf upon which this
+    # implementation is based.
+    # In section 2.1 Equation 5, specifically:
+    # h_t = r_t \odot g(c_t) + (1 - r_t) \odot x_t
+    # the pointwise operation between r_t and x_t means they have
+    # the same shape (since we are implementing an RNN cell, braodcasting
+    # does not happen to input of a single timestep); by the same
+    # reasons, x_t has the same shape as h_t, essentially mandating that
+    # input_depth = unit_num.
+    if input_depth != self._num_units:
+      raise ValueError("SRU requires input_depth == num_units, got "
+                       "input_depth = %s, num_units = %s" % (input_depth,
+                                                             self._num_units))
+
+    self._kernel = self.add_variable(
+        rnn_cell_impl._WEIGHTS_VARIABLE_NAME,
+        shape=[input_depth, 3 * self._num_units])
+
+    self._bias = self.add_variable(
+        rnn_cell_impl._BIAS_VARIABLE_NAME,
+        shape=[2 * self._num_units],
+        initializer=init_ops.constant_initializer(0.0, dtype=self.dtype))
+
+    self._built = True
+
+  def call(self, inputs, state):
+    """Simple recurrent unit (SRU) with num_units cells."""
+
+    U = math_ops.matmul(inputs, self._kernel)
+    x_bar, f_intermediate, r_intermediate = array_ops.split(value=U,
+                                                            num_or_size_splits=3,
+                                                            axis=1)
+
+    f_r = math_ops.sigmoid(nn_ops.bias_add(array_ops.concat(
+        [f_intermediate, r_intermediate], 1), self._bias))
+    f, r = array_ops.split(value=f_r, num_or_size_splits=2, axis=1)
+
+    c = f * state + (1.0 - f) * x_bar
+    h = r * self._activation(c) + (1.0 - r) * inputs
+
+    return h, c
+
+
+class WeightNormLSTMCell(rnn_cell_impl.RNNCell):
+  """Weight normalized LSTM Cell. Adapted from `rnn_cell_impl.LSTMCell`.
+
+    The weight-norm implementation is based on:
+    https://arxiv.org/abs/1602.07868
+    Tim Salimans, Diederik P. Kingma.
+    Weight Normalization: A Simple Reparameterization to Accelerate
+    Training of Deep Neural Networks
+
+    The default LSTM implementation based on:
+    http://www.bioinf.jku.at/publications/older/2604.pdf
+    S. Hochreiter and J. Schmidhuber.
+    "Long Short-Term Memory". Neural Computation, 9(8):1735-1780, 1997.
+
+    The class uses optional peephole connections, optional cell clipping
+    and an optional projection layer.
+
+    The optional peephole implementation is based on:
+    https://research.google.com/pubs/archive/43905.pdf
+    Hasim Sak, Andrew Senior, and Francoise Beaufays.
+    "Long short-term memory recurrent neural network architectures for
+    large scale acoustic modeling." INTERSPEECH, 2014.
+  """
+
+  def __init__(self, num_units, norm=True, use_peepholes=False,
+               cell_clip=None, initializer=None, num_proj=None,
+               proj_clip=None, forget_bias=1, activation=None,
+               reuse=None):
+    """Initialize the parameters of a weight-normalized LSTM cell.
+
+    Args:
+      num_units: int, The number of units in the LSTM cell
+      norm: If `True`, apply normalization to the weight matrices. If False,
+        the result is identical to that obtained from `rnn_cell_impl.LSTMCell`
+      use_peepholes: bool, set `True` to enable diagonal/peephole connections.
+      cell_clip: (optional) A float value, if provided the cell state is clipped
+        by this value prior to the cell output activation.
+      initializer: (optional) The initializer to use for the weight matrices.
+      num_proj: (optional) int, The output dimensionality for the projection
+        matrices.  If None, no projection is performed.
+      proj_clip: (optional) A float value.  If `num_proj > 0` and `proj_clip` is
+        provided, then the projected values are clipped elementwise to within
+        `[-proj_clip, proj_clip]`.
+      forget_bias: Biases of the forget gate are initialized by default to 1
+        in order to reduce the scale of forgetting at the beginning of
+        the training.
+      activation: Activation function of the inner states.  Default: `tanh`.
+      reuse: (optional) Python boolean describing whether to reuse variables
+        in an existing scope.  If not `True`, and the existing scope already has
+        the given variables, an error is raised.
+    """
+    super(WeightNormLSTMCell, self).__init__(_reuse=reuse)
+
+    self._scope = 'wn_lstm_cell'
+    self._num_units = num_units
+    self._norm = norm
+    self._initializer = initializer
+    self._use_peepholes = use_peepholes
+    self._cell_clip = cell_clip
+    self._num_proj = num_proj
+    self._proj_clip = proj_clip
+    self._activation = activation or math_ops.tanh
+    self._forget_bias = forget_bias
+
+    self._weights_variable_name = "kernel"
+    self._bias_variable_name = "bias"
+
+    if num_proj:
+      self._state_size = rnn_cell_impl.LSTMStateTuple(num_units, num_proj)
+      self._output_size = num_proj
+    else:
+      self._state_size = rnn_cell_impl.LSTMStateTuple(num_units, num_units)
+      self._output_size = num_units
+
+  @property
+  def state_size(self):
+    return self._state_size
+
+  @property
+  def output_size(self):
+    return self._output_size
+
+  def _normalize(self, weight, name):
+    """Apply weight normalization.
+
+    Args:
+      weight: a 2D tensor with known number of columns.
+      name: string, variable name for the normalizer.
+    Returns:
+      A tensor with the same shape as `weight`.
+    """
+
+    output_size = weight.get_shape().as_list()[1]
+    g = vs.get_variable(name, [output_size], dtype=weight.dtype)
+    return nn_impl.l2_normalize(weight, dim=0) * g
+
+  def _linear(self, args,
+              output_size,
+              norm,
+              bias,
+              bias_initializer=None,
+              kernel_initializer=None):
+    """Linear map: sum_i(args[i] * W[i]), where W[i] is a variable.
+
+    Args:
+      args: a 2D Tensor or a list of 2D, batch x n, Tensors.
+      output_size: int, second dimension of W[i].
+      bias: boolean, whether to add a bias term or not.
+      bias_initializer: starting value to initialize the bias
+        (default is all zeros).
+      kernel_initializer: starting value to initialize the weight.
+
+    Returns:
+      A 2D Tensor with shape [batch x output_size] equal to
+      sum_i(args[i] * W[i]), where W[i]s are newly created matrices.
+
+    Raises:
+      ValueError: if some of the arguments has unspecified or wrong shape.
+    """
+    if args is None or (nest.is_sequence(args) and not args):
+      raise ValueError("`args` must be specified")
+    if not nest.is_sequence(args):
+      args = [args]
+
+    # Calculate the total size of arguments on dimension 1.
+    total_arg_size = 0
+    shapes = [a.get_shape() for a in args]
+    for shape in shapes:
+      if shape.ndims != 2:
+        raise ValueError("linear is expecting 2D arguments: %s" % shapes)
+      if shape[1].value is None:
+        raise ValueError("linear expects shape[1] to be provided for shape %s, "
+                         "but saw %s" % (shape, shape[1]))
+      else:
+        total_arg_size += shape[1].value
+
+    dtype = [a.dtype for a in args][0]
+
+    # Now the computation.
+    scope = vs.get_variable_scope()
+    with vs.variable_scope(scope) as outer_scope:
+      weights = vs.get_variable(
+          self._weights_variable_name, [total_arg_size, output_size],
+          dtype=dtype,
+          initializer=kernel_initializer)
+      if norm:
+        wn = []
+        st = 0
+        with ops.control_dependencies(None):
+          for i in range(len(args)):
+            en = st + shapes[i][1].value
+            wn.append(self._normalize(weights[st:en, :],
+                                      name='norm_{}'.format(i)))
+            st = en
+
+          weights = array_ops.concat(wn, axis=0)
+
+      if len(args) == 1:
+        res = math_ops.matmul(args[0], weights)
+      else:
+        res = math_ops.matmul(array_ops.concat(args, 1), weights)
+      if not bias:
+        return res
+
+      with vs.variable_scope(outer_scope) as inner_scope:
+        inner_scope.set_partitioner(None)
+        if bias_initializer is None:
+          bias_initializer = init_ops.constant_initializer(0.0, dtype=dtype)
+
+        biases = vs.get_variable(
+            self._bias_variable_name, [output_size],
+            dtype=dtype,
+            initializer=bias_initializer)
+
+      return nn_ops.bias_add(res, biases)
+
+  def call(self, inputs, state):
+    """Run one step of LSTM.
+
+    Args:
+      inputs: input Tensor, 2D, batch x num_units.
+      state: A tuple of state Tensors, both `2-D`, with column sizes
+       `c_state` and `m_state`.
+
+    Returns:
+      A tuple containing:
+
+      - A `2-D, [batch x output_dim]`, Tensor representing the output of the
+        LSTM after reading `inputs` when previous state was `state`.
+        Here output_dim is:
+           num_proj if num_proj was set,
+           num_units otherwise.
+      - Tensor(s) representing the new state of LSTM after reading `inputs` when
+        the previous state was `state`.  Same type and shape(s) as `state`.
+
+    Raises:
+      ValueError: If input size cannot be inferred from inputs via
+        static shape inference.
+    """
+    dtype = inputs.dtype
+    num_units = self._num_units
+    sigmoid = math_ops.sigmoid
+    c, h = state
+
+    input_size = inputs.get_shape().with_rank(2)[1]
+    if input_size.value is None:
+      raise ValueError("Could not infer input size from inputs.get_shape()[-1]")
+
+    with vs.variable_scope(self._scope, initializer=self._initializer):
+
+      concat = self._linear([inputs, h], 4 * num_units,
+                            norm=self._norm, bias=True)
+
+      # i = input_gate, j = new_input, f = forget_gate, o = output_gate
+      i, j, f, o = array_ops.split(value=concat, num_or_size_splits=4, axis=1)
+
+      if self._use_peepholes:
+        w_f_diag = vs.get_variable("w_f_diag", shape=[num_units], dtype=dtype)
+        w_i_diag = vs.get_variable("w_i_diag", shape=[num_units], dtype=dtype)
+        w_o_diag = vs.get_variable("w_o_diag", shape=[num_units], dtype=dtype)
+
+        new_c = (c * sigmoid(f + self._forget_bias + w_f_diag * c)
+                 + sigmoid(i + w_i_diag * c) * self._activation(j))
+      else:
+        new_c = (c * sigmoid(f + self._forget_bias)
+                 + sigmoid(i) * self._activation(j))
+
+      if self._cell_clip is not None:
+        # pylint: disable=invalid-unary-operand-type
+        new_c = clip_ops.clip_by_value(new_c, -self._cell_clip, self._cell_clip)
+        # pylint: enable=invalid-unary-operand-type
+      if self._use_peepholes:
+        new_h = sigmoid(o + w_o_diag * new_c) * self._activation(new_c)
+      else:
+        new_h = sigmoid(o) * self._activation(new_c)
+
+      if self._num_proj is not None:
+        with vs.variable_scope("projection"):
+          new_h = self._linear(new_h,
+                               self._num_proj,
+                               norm=self._norm,
+                               bias=False)
+
+        if self._proj_clip is not None:
+          # pylint: disable=invalid-unary-operand-type
+          new_h = clip_ops.clip_by_value(new_h,
+                                         -self._proj_clip,
+                                         self._proj_clip)
+          # pylint: enable=invalid-unary-operand-type
+
+      new_state = rnn_cell_impl.LSTMStateTuple(new_c, new_h)
+      return new_h, new_state
